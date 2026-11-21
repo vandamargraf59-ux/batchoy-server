@@ -103,7 +103,8 @@ function render() {
   if (cat === 'all') group(cats.length ? 'Others' : '', M.products.filter(function (p) { return p.categoryId == null || !M.categories.some(function (c) { return c.id === p.categoryId; }); }));
   if (!sections.length) sections.push(h('div', { class: 'empty', text: 'No items to show yet.' }));
   var y = window.scrollY; list.replaceChildren.apply(list, sections); window.scrollTo(0, y);
-  var n = cartCount(), bar = $('#cartBar');
+  var n = cartCount(), bar = $('#cartBar'), bk = $('#basketBtn');
+  bk.classList.toggle('hidden', !n); $('#basketN').textContent = n;
   if (n && !sheetKind) {
     bar.classList.remove('hidden');
     bar.replaceChildren(h('span', { class: 'n', text: String(n) }), h('span', { class: 'l', text: 'View my order' }), h('span', { text: peso(subtotal()) }));
@@ -127,6 +128,7 @@ function closeSheet() { sheetKind = ''; $('#sheetBack').classList.add('hidden');
 $('#sheetBack').addEventListener('mousedown', function (e) { if (e.target === this) closeSheet(); });
 document.addEventListener('keydown', function (e) { if (e.key === 'Escape' && sheetKind) closeSheet(); });
 $('#cartBar').addEventListener('click', function () { openSheet('cart'); drawCart(); });
+$('#basketBtn').addEventListener('click', function () { if (cartCount()) { openSheet('cart'); drawCart(); } });
 
 function sheetShell(title, body, foot) {
   var s = $('#sheet');
