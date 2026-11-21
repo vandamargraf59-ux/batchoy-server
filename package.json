@@ -1,0 +1,10 @@
+{
+  "name": "batchoyan-order-server",
+  "version": "1.0.0",
+  "description": "Online order server for the Batchoyan de Lapaz POS app",
+  "main": "server.js",
+  "scripts": { "start": "node server.js", "test": "node test/api.test.js" },
+  "engines": { "node": ">=18" },
+  "license": "UNLICENSED",
+  "private": true
+}
