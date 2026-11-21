@@ -16,7 +16,7 @@ let n = 0; const ok = (name, fn) => fn().then(() => { n++; console.log('  ok  ' 
 const png = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////////////////////////////////////////////////////////////////////////////////wgALCAABAAEBAREA/8QAFBABAAAAAAAAAAAAAAAAAAAAAP/aAAgBAQABPxA=';
 (async () => {
   for (let i = 0; i < 40; i++) { try { await fetch(base + '/healthz'); break; } catch (e) { await sleep(100); } }
-  const menu = { store: { name: 'Test Batchoy', acceptingOrders: true, deliveryEnabled: true, deliveryFee: 30, minOrder: 50, gcashNumber: '09171234567', gcashName: 'Juan' },
+  const menu = { store: { name: 'Test Batchoy', acceptingOrders: true, deliveryEnabled: true, deliveryFee: 30, minOrder: 50, gcashNumber: '09171234567', gcashName: 'Juan', payFirst: false },
     categories: [{ id: 1, name: 'Batchoy' }], products: [
       { id: 1, name: 'Special Batchoy', categoryId: 1, price: 99, active: true, track: false, stock: 0, imageSig: 'a1' },
       { id: 2, name: 'Egg', categoryId: 1, price: 15, active: true, track: true, stock: 3, imageSig: '' },
@@ -43,7 +43,7 @@ const png = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////
   });
   await ok('place pickup order, price computed on server', async () => {
     const r = await call('POST', '/api/orders', order({ items: [{ id: 1, qty: 2 }, { id: 2, qty: 1 }], price: 1, total: 1 }), false);
-    assert.equal(r.s, 201); assert.equal(r.j.order.total, 213); assert.equal(r.j.order.status, 'new'); assert(/^BT-[A-Z0-9]{5}$/.test(r.j.order.code)); code = r.j.order.code;
+    assert.equal(r.s, 201); assert.equal(r.j.order.total, 213); assert.equal(r.j.order.status, 'new'); assert(/^BT-[A-Z0-9]{6}$/.test(r.j.order.code)); code = r.j.order.code;
   });
   await ok('double-submit returns same order', async () => {
     const body = order({ clientId: 'dup-client-id-1' }); const a = await call('POST', '/api/orders', body, false), b = await call('POST', '/api/orders', body, false);
@@ -89,6 +89,39 @@ const png = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////
     assert.equal((await call('POST', '/api/orders/' + b.j.order.code + '/cancel', null, false)).s, 409);
     await call('POST', '/api/admin/orders/' + b.j.order.code + '/status', { status: 'cancelled', reason: 'Out of stock' });
   });
+  await ok('GCash QR upload + public exposure', async () => {
+    const m1 = await call('PUT', '/api/admin/menu', Object.assign({}, menu, { store: Object.assign({}, menu.store, { gcashQrSig: 'qr1' }) })); assert.equal(m1.j.needQr, true);
+    assert.equal((await call('PUT', '/api/admin/qr', { sig: 'qr1', dataUrl: 'data:text/html;base64,PGI+' })).s, 400);
+    assert.equal((await call('PUT', '/api/admin/qr', { sig: 'qr1', dataUrl: png })).s, 200);
+    const m2 = await call('PUT', '/api/admin/menu', Object.assign({}, menu, { store: Object.assign({}, menu.store, { gcashQrSig: 'qr1' }) })); assert.equal(m2.j.needQr, false);
+    const pub = (await call('GET', '/api/menu', null, false)).j.store; assert(pub.gcashQr.startsWith('/qr?v=')); assert.equal(pub.gcashEnabled, true);
+    const img = await fetch(base + pub.gcashQr); assert.equal(img.status, 200); assert.equal(img.headers.get('content-type'), 'image/jpeg');
+    const m3 = await call('PUT', '/api/admin/menu', menu); assert.equal(m3.j.needQr, false); assert.equal((await call('GET', '/api/menu', null, false)).j.store.gcashQr, '');
+  });
+  await ok('pay-first: cash refused, GCash ref required, screenshot stored', async () => {
+    const pf = Object.assign({}, menu, { store: Object.assign({}, menu.store, { payFirst: true }) });
+    await call('PUT', '/api/admin/menu', pf);
+    assert.equal((await call('GET', '/api/menu', null, false)).j.store.payFirst, true);
+    let r = await call('POST', '/api/orders', order({ payment: { method: 'cash' } }), false); assert.equal(r.s, 400); assert.equal(r.j.field, 'payment');
+    r = await call('POST', '/api/orders', order({ payment: { method: 'gcash', ref: '12' } }), false); assert.equal(r.j.field, 'ref');
+    r = await call('POST', '/api/orders', order({ payment: { method: 'gcash', ref: '1234567' }, proof: 'data:text/html;base64,PGI+' }), false); assert.equal(r.j.field, 'proof');
+    r = await call('POST', '/api/orders', order({ phone: '09175550001', payment: { method: 'gcash', ref: '1234567' }, proof: png }), false);
+    assert.equal(r.s, 201); assert.equal(r.j.order.payment.hasProof, true); assert.equal(r.j.order.phone, '09*****0001'); const c = r.j.order.code;
+    const p = await call('GET', '/api/admin/orders/' + c + '/proof'); assert.equal(p.s, 200); assert(p.j.dataUrl.startsWith('data:image/jpeg;base64,'));
+    assert.equal((await call('GET', '/api/admin/orders/' + c + '/proof', null, false)).s, 401);
+    const adm = (await call('GET', '/api/admin/orders?since=0')).j.orders.find(x => x.code === c); assert.equal(adm.hasProof, true); assert.equal(adm.payment.ref, '1234567');
+    await call('POST', '/api/admin/orders/' + c + '/status', { status: 'cancelled' });
+    await call('PUT', '/api/admin/menu', menu);
+  });
+  await ok('customer dashboard: lookup by codes, find by code + last 4 digits', async () => {
+    const a = await call('POST', '/api/orders', order({ phone: '09176660002' }), false), c = a.j.order.code;
+    const lk = await call('POST', '/api/orders/lookup', { codes: [c, 'BT-NOPE12', c.toLowerCase()] }, false); assert.equal(lk.s, 200);
+    assert.equal(lk.j.orders.length, 2); assert(!('address' in lk.j.orders[0])); assert(!('phone' in lk.j.orders[0]));
+    const f = await call('POST', '/api/orders/find', { code: c.toLowerCase(), phone4: '0002' }, false); assert.equal(f.s, 200); assert.equal(f.j.order.code, c); assert.equal(f.j.order.fullName, 'Maria Cruz');
+    assert.equal((await call('POST', '/api/orders/find', { code: c, phone4: '9999' }, false)).s, 404);
+    assert.equal((await call('POST', '/api/orders/find', { code: 'BT-ZZZZZZ', phone4: '0002' }, false)).s, 404);
+    await call('POST', '/api/admin/orders/' + c + '/status', { status: 'cancelled' });
+  });
   await ok('store closed blocks orders', async () => {
     await call('PUT', '/api/admin/menu', Object.assign({}, menu, { store: Object.assign({}, menu.store, { acceptingOrders: false }) }));
     assert.equal((await call('GET', '/api/menu', null, false)).j.store.open, false);
@@ -100,7 +133,7 @@ const png = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQEASABIAAD/2wBDAP//////////
     for (let i = 0; i < 4; i++) last = await call('POST', '/api/orders', order({ phone: p }), false);
     assert.equal(last.s, 429);
   });
-  await ok('oversized body rejected', async () => { const r = await call('POST', '/api/orders', { clientId: 'x'.repeat(40000) }, false); assert.equal(r.s, 413); });
+  await ok('oversized body rejected', async () => { const r = await call('POST', '/api/orders', { clientId: 'x'.repeat(800000) }, false); assert.equal(r.s, 413); });
   await ok('data survives restart (file db)', async () => { assert(JSON.parse(fs.readFileSync(path.join(dir, 'db.json'), 'utf8')).orders[code]); });
   console.log(n + ' checks passed'); srv.kill();
 })().catch(e => { console.error(e); srv.kill(); process.exit(1); });

@@ -19,6 +19,8 @@ const ADMIN_TOKEN = String(env.ADMIN_TOKEN || '');
 const DATA_DIR = path.resolve(env.DATA_DIR || path.join(__dirname, 'data'));
 const PUBLIC_DIR = path.join(__dirname, 'public');
 const IMG_DIR = path.join(DATA_DIR, 'img');
+const PROOF_DIR = path.join(DATA_DIR, 'proof');
+const QR_FILE = path.join(DATA_DIR, 'gcash-qr');
 const DB_FILE = path.join(DATA_DIR, 'db.json');
 const TRUST_PROXY = /^(1|true|yes)$/i.test(env.TRUST_PROXY || '');
 const TG_TOKEN = String(env.TELEGRAM_BOT_TOKEN || '').trim();
@@ -48,6 +50,7 @@ const NEXT = {
 
 /* ------------------------------------------------------------------ storage */
 fs.mkdirSync(IMG_DIR, { recursive: true });
+fs.mkdirSync(PROOF_DIR, { recursive: true });
 let db = { epoch: crypto.randomBytes(8).toString('hex'), seq: 0, orders: {}, menu: null, lastAdminSeen: 0 };
 try {
   if (fs.existsSync(DB_FILE)) {
@@ -99,11 +102,12 @@ function newCode() {
   const A = '23456789ABCDEFGHJKMNPQRSTUVWXYZ';
   for (let n = 0; n < 50; n++) {
     let c = 'BT-';
-    for (let i = 0; i < 5; i++) c += A[crypto.randomInt(A.length)];
+    for (let i = 0; i < 6; i++) c += A[crypto.randomInt(A.length)];
     if (!db.orders[c]) return c;
   }
   throw new Error('could not generate order code');
 }
+const maskPhone = p => String(p).length >= 8 ? String(p).slice(0, 2) + '*'.repeat(String(p).length - 6) + String(p).slice(-4) : String(p);
 function normPhone(raw) {
   let d = String(raw || '').replace(/[^\d+]/g, '');
   if (/^\+?63\d{10}$/.test(d)) d = '0' + d.replace(/^\+?63/, '');
@@ -173,7 +177,7 @@ function orderText(o, head) {
   o.items.forEach(i => lines.push(i.qty + ' x ' + i.name));
   if (o.fee) lines.push('Delivery fee: ' + peso(o.fee));
   lines.push('TOTAL: ' + peso(o.total));
-  lines.push('Payment: ' + (o.payment.method === 'gcash' ? 'GCash' + (o.payment.ref ? ' (ref ' + o.payment.ref + ')' : '') : 'Cash'));
+  lines.push('Payment: ' + (o.payment.method === 'gcash' ? 'GCash' + (o.payment.ref ? ' (ref ' + o.payment.ref + ')' : '') + (o.hasProof ? ' + screenshot' : '') : 'Cash'));
   if (o.note) lines.push('Note: ' + o.note);
   lines.push('', 'Open the Batchoyan POS app > Online tab' + (PUBLIC_URL ? '' : '.'));
   return lines.join('\n');
@@ -199,7 +203,9 @@ function publicMenu() {
       name: s.name || 'Batchoyan de Lapaz', address: s.address || '', phone: s.phone || '', note: s.note || '',
       open: st.open, closedReason: st.reason,
       deliveryEnabled: !!s.deliveryEnabled, deliveryFee: r2(s.deliveryFee || 0), minOrder: r2(s.minOrder || 0),
-      gcashEnabled: !!(s.gcashNumber), gcashNumber: s.gcashNumber || '', gcashName: s.gcashName || ''
+      gcashEnabled: !!(s.gcashNumber), gcashNumber: s.gcashNumber || '', gcashName: s.gcashName || '',
+      gcashQr: s.hasQr ? '/qr?v=' + crypto.createHash('sha1').update(String(s.gcashQrSig)).digest('hex').slice(0, 10) : '',
+      payFirst: !!(s.payFirst !== false && s.gcashNumber)
     },
     categories: (m.categories || []).map(c => ({ id: c.id, name: c.name })),
     products: (m.products || []).filter(p => p.active !== false).map(p => ({
@@ -212,17 +218,19 @@ function publicMenu() {
 
 /* ------------------------------------------------------------------ orders */
 function touch(o) { o.seq = ++db.seq; o.updatedAt = now(); }
-function publicOrder(o) {
-  return {
+function publicOrder(o, full) {
+  const r = {
     code: o.code, status: o.status, type: o.type, createdAt: o.createdAt, updatedAt: o.updatedAt, times: o.times,
-    items: o.items, subtotal: o.subtotal, fee: o.fee, total: o.total, payment: { method: o.payment.method },
+    items: o.items, subtotal: o.subtotal, fee: o.fee, total: o.total, payment: { method: o.payment.method, ref: o.payment.ref || '', hasProof: !!o.hasProof },
     name: o.customer.name.split(' ')[0], cancelReason: o.cancelReason || '', storeName: storeCfg().name || ''
   };
+  if (full) { r.address = o.address; r.note = o.note; r.phone = maskPhone(o.customer.phone); r.fullName = o.customer.name; }
+  return r;
 }
 async function createOrder(req, res) {
   const ip = clientIp(req);
   if (limited('ord:' + ip, ORDER_RATE_MAX, 10 * 60000)) return fail(res, 429, 'Too many orders from this device. Please wait a few minutes.', 'rate');
-  let b; try { b = await readBody(req, 32 * 1024); } catch (e) { return fail(res, e.status || 400, e.message, 'invalid'); }
+  let b; try { b = await readBody(req, 720 * 1024); } catch (e) { return fail(res, e.status || 400, e.message, 'invalid'); }
 
   const st = openState();
   if (!st.open) {
@@ -232,7 +240,7 @@ async function createOrder(req, res) {
   const clientId = clean(b.clientId, 64);
   if (clientId.length < 8) return fail(res, 400, 'Invalid request. Please refresh the page and try again.', 'invalid');
   // idempotency: same cart submitted twice (double tap / retry) returns the same order
-  for (const k in db.orders) { if (db.orders[k].clientId === clientId) return json(res, 200, { ok: true, duplicate: true, order: publicOrder(db.orders[k]) }); }
+  for (const k in db.orders) { if (db.orders[k].clientId === clientId) return json(res, 200, { ok: true, duplicate: true, order: publicOrder(db.orders[k], true) }); }
 
   const name = clean(b.name, 60), phone = normPhone(b.phone);
   if (name.length < 2) return fail(res, 400, 'Please enter your name.', 'invalid', { field: 'name' });
@@ -241,9 +249,19 @@ async function createOrder(req, res) {
   if (type === 'delivery' && !s.deliveryEnabled) return fail(res, 400, 'Delivery is not available right now. Please choose pick-up.', 'invalid', { field: 'type' });
   const address = type === 'delivery' ? clean(b.address, 200) : '';
   if (type === 'delivery' && address.length < 6) return fail(res, 400, 'Please enter your complete delivery address.', 'invalid', { field: 'address' });
+  const payFirst = !!(s.payFirst !== false && s.gcashNumber);
+  if (payFirst && !(b.payment && b.payment.method === 'gcash')) return fail(res, 400, 'Please pay with GCash first, then enter your reference number.', 'invalid', { field: 'payment' });
   const method = b.payment && b.payment.method === 'gcash' ? 'gcash' : 'cash';
   if (method === 'gcash' && !s.gcashNumber) return fail(res, 400, 'GCash is not available. Please choose cash.', 'invalid', { field: 'payment' });
   const ref = method === 'gcash' ? clean(b.payment && b.payment.ref, 40) : '';
+  if (method === 'gcash' && payFirst && ref.length < 4) return fail(res, 400, 'Please enter the GCash reference number from your payment.', 'invalid', { field: 'ref' });
+  let proof = null;
+  if (b.proof) {
+    const pm = /^data:image\/(jpeg|png|webp);base64,([A-Za-z0-9+/=]+)$/.exec(String(b.proof));
+    const buf = pm ? Buffer.from(pm[2], 'base64') : null;
+    if (!buf || !buf.length || buf.length > 450 * 1024) return fail(res, 400, 'The payment screenshot is not valid or too large. Try another photo.', 'invalid', { field: 'proof' });
+    proof = { buf, mime: 'image/' + pm[1] };
+  }
   const note = clean(b.note, 200);
 
   if (!Array.isArray(b.items) || !b.items.length || b.items.length > 40) return fail(res, 400, 'Your order is empty.', 'invalid');
@@ -275,10 +293,11 @@ async function createOrder(req, res) {
     code: newCode(), seq: 0, clientId, createdAt: t, updatedAt: t, status: 'new', times: { new: t },
     type, customer: { name, phone }, address, note, items, subtotal, fee, total, payment: { method, ref }, cancelReason: ''
   };
+  if (proof) { try { fs.writeFileSync(path.join(PROOF_DIR, o.code), proof.buf); o.hasProof = true; o.proofMime = proof.mime; } catch (e) { console.error('[proof] ' + e.message); } }
   touch(o); db.orders[o.code] = o; save();
   console.log('[order] ' + o.code + ' ' + o.type + ' ' + peso(o.total));
   notify(orderText(o, 'NEW ONLINE ORDER'));
-  json(res, 201, { ok: true, order: publicOrder(o) });
+  json(res, 201, { ok: true, order: publicOrder(o, true) });
 }
 function setStatus(o, status, reason) {
   if (o.status === status) return true;
@@ -313,8 +332,12 @@ function putMenu(b) {
     name: clean(s.name, 60) || 'Batchoyan de Lapaz', address: clean(s.address, 160), phone: clean(s.phone, 30), note: clean(s.note, 200),
     acceptingOrders: s.acceptingOrders !== false, deliveryEnabled: !!s.deliveryEnabled,
     deliveryFee: Math.max(0, r2(Number(s.deliveryFee) || 0)), minOrder: Math.max(0, r2(Number(s.minOrder) || 0)),
-    gcashNumber: clean(s.gcashNumber, 20), gcashName: clean(s.gcashName, 60)
+    gcashNumber: clean(s.gcashNumber, 20), gcashName: clean(s.gcashName, 60), payFirst: s.payFirst !== false, gcashQrSig: clean(s.gcashQrSig, 120)
   };
+  const prev = storeCfg();
+  const haveQr = !!(store.gcashQrSig && prev.hasQr && prev.gcashQrSig === store.gcashQrSig && fs.existsSync(QR_FILE));
+  store.hasQr = haveQr; store.qrMime = haveQr ? prev.qrMime : '';
+  if (!store.gcashQrSig) { try { fs.unlinkSync(QR_FILE); } catch (e) { /* none */ } }
   const categories = (Array.isArray(b.categories) ? b.categories.slice(0, 100) : []).map(c => ({ id: Number(c && c.id), name: clean(c && c.name, 40) })).filter(c => Number.isInteger(c.id) && c.name);
   const products = sanitizeProducts(b.products);
   const old = new Map(((db.menu && db.menu.products) || []).map(p => [p.id, p]));
@@ -328,7 +351,7 @@ function putMenu(b) {
   for (const id of old.keys()) if (!products.some(p => p.id === id)) dropImage(id);
   db.menu = { store, categories, products, updatedAt: now() };
   save();
-  return need;
+  return { need, needQr: !!store.gcashQrSig && !haveQr };
 }
 function putImage(id, b) {
   const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.dataUrl || ''));
@@ -342,6 +365,17 @@ function putImage(id, b) {
   p.hasImage = true; p.imgMime = m[1]; p.imageSig = clean(b.sig, 120) || p.imageSig || String(buf.length);
   save();
   return '';
+}
+
+function putQr(b) {
+  const m = /^data:(image\/(?:jpeg|png|webp));base64,([A-Za-z0-9+/=]+)$/.exec(String(b.dataUrl || ''));
+  if (!m) return 'Unsupported image';
+  const buf = Buffer.from(m[2], 'base64');
+  if (!buf.length || buf.length > 1536 * 1024) return 'Image too large';
+  if (!db.menu) return 'Sync the menu first';
+  const tmp = QR_FILE + '.tmp'; fs.writeFileSync(tmp, buf); fs.renameSync(tmp, QR_FILE);
+  Object.assign(db.menu.store, { hasQr: true, qrMime: m[1], gcashQrSig: clean(b.sig, 120) || String(buf.length) });
+  save(); return '';
 }
 
 /* ------------------------------------------------------------------ routing */
@@ -386,7 +420,19 @@ async function admin(req, res, url, parts) {
   }
   if (sub === 'menu' && method === 'PUT') {
     let b; try { b = await readBody(req, 1024 * 1024); } catch (e) { return fail(res, e.status || 400, e.message, 'invalid'); }
-    return json(res, 200, { ok: true, needImages: putMenu(b), updatedAt: db.menu.updatedAt });
+    const pm = putMenu(b);
+    return json(res, 200, { ok: true, needImages: pm.need, needQr: pm.needQr, updatedAt: db.menu.updatedAt });
+  }
+  if (sub === 'qr' && method === 'PUT' && parts.length === 3) {
+    let b; try { b = await readBody(req, 3 * 1024 * 1024); } catch (e) { return fail(res, e.status || 400, e.message, 'invalid'); }
+    const err = putQr(b);
+    return err ? fail(res, 400, err, 'invalid') : json(res, 200, { ok: true });
+  }
+  if (sub === 'orders' && method === 'GET' && parts.length === 5 && parts[4] === 'proof') {
+    const o = db.orders[decodeURIComponent(parts[3])];
+    if (!o || !o.hasProof) return fail(res, 404, 'No payment screenshot for this order.', 'notfound');
+    try { return json(res, 200, { dataUrl: 'data:' + (o.proofMime || 'image/jpeg') + ';base64,' + fs.readFileSync(path.join(PROOF_DIR, o.code)).toString('base64') }); }
+    catch (e) { return fail(res, 404, 'Screenshot file is missing.', 'notfound'); }
   }
   if (sub === 'image' && method === 'PUT' && parts.length === 4) {
     const id = Number(parts[3]);
@@ -409,6 +455,19 @@ async function api(req, res, url) {
   }
   if (parts[1] === 'menu' && method === 'GET' && parts.length === 2) return json(res, 200, publicMenu());
   if (parts[1] === 'orders' && method === 'POST' && parts.length === 2) return createOrder(req, res);
+  if (parts[1] === 'orders' && parts.length === 3 && parts[2] === 'lookup' && method === 'POST') {
+    if (limited('lk:' + clientIp(req), 20, 60000)) return fail(res, 429, 'Too many requests.', 'rate');
+    let b; try { b = await readBody(req, 4096); } catch (e) { return fail(res, e.status || 400, e.message, 'invalid'); }
+    const codes = (Array.isArray(b.codes) ? b.codes : []).slice(0, 30).map(c => String(c).toUpperCase());
+    return json(res, 200, { orders: codes.map(c => db.orders[c]).filter(Boolean).map(o => publicOrder(o)) });
+  }
+  if (parts[1] === 'orders' && parts.length === 3 && parts[2] === 'find' && method === 'POST') {
+    if (limited('find:' + clientIp(req), 15, 600000)) return fail(res, 429, 'Too many tries. Please wait a few minutes.', 'rate');
+    let b; try { b = await readBody(req, 4096); } catch (e) { return fail(res, e.status || 400, e.message, 'invalid'); }
+    const o = db.orders[String(b.code || '').trim().toUpperCase()], last4 = String(b.phone4 || '').replace(/\D/g, '');
+    if (!o || last4.length !== 4 || o.customer.phone.slice(-4) !== last4) return fail(res, 404, 'We could not find an order with those details.', 'notfound');
+    return json(res, 200, { order: publicOrder(o, true) });
+  }
   if (parts[1] === 'orders' && parts.length === 3 && method === 'GET') {
     if (limited('track:' + clientIp(req), 120, 60000)) return fail(res, 429, 'Too many requests.', 'rate');
     const o = db.orders[decodeURIComponent(parts[2]).toUpperCase()];
@@ -458,6 +517,11 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname === '/healthz') return json(res, 200, { ok: true });
     if (url.pathname.startsWith('/api/')) return await api(req, res, url);
     if (url.pathname.startsWith('/img/') && req.method === 'GET') return serveImage(res, url);
+    if (url.pathname === '/qr' && req.method === 'GET') {
+      const s = storeCfg();
+      if (!s.hasQr) return send(res, 404, 'Not found', { 'Content-Type': 'text/plain' });
+      return fs.readFile(QR_FILE, (err, buf) => err ? send(res, 404, 'Not found', { 'Content-Type': 'text/plain' }) : send(res, 200, buf, { 'Content-Type': s.qrMime || 'image/jpeg', 'Cache-Control': 'public, max-age=31536000, immutable' }));
+    }
     if (req.method !== 'GET' && req.method !== 'HEAD') return send(res, 405, 'Method not allowed', { 'Content-Type': 'text/plain' });
     return serveStatic(req, res, url);
   } catch (e) {
@@ -469,7 +533,7 @@ const server = http.createServer(async (req, res) => {
 /* purge finished orders after RETENTION_DAYS (the POS app keeps its own permanent copy) */
 function purge() {
   const cut = now() - RETENTION_DAYS * 86400000; let n = 0;
-  for (const k in db.orders) { const o = db.orders[k]; if (!ACTIVE.includes(o.status) && o.updatedAt < cut) { delete db.orders[k]; n++; } }
+  for (const k in db.orders) { const o = db.orders[k]; if (!ACTIVE.includes(o.status) && o.updatedAt < cut) { if (o.hasProof) { try { fs.unlinkSync(path.join(PROOF_DIR, o.code)); } catch (e) { /* gone */ } } delete db.orders[k]; n++; } }
   if (n) { save(); console.log('[purge] removed ' + n + ' old order(s)'); }
 }
 setInterval(purge, 3600000).unref();

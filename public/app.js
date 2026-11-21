@@ -25,8 +25,8 @@ var M = null;                       // last menu from the server
 var cart = store('bt_cart') || {};  // {productId: qty}
 var cat = 'all', loadErr = false;
 var cust = store('bt_cust') || { name: '', phone: '', address: '', type: 'pickup', method: 'cash' };
-var track = store('bt_order');      // {code}
-var tOrder = null;                  // last fetched order for tracking
+var mine = store('bt_orders') || []; // orders placed from this phone (newest first), with their last known status
+var viewCode = '';                  // order currently shown in the tracking sheet
 var sheetKind = '';                 // 'cart' | 'track' | ''
 var form = null;                    // checkout form state
 
@@ -144,7 +144,8 @@ function drawCart() {
   if (!ids.length) { sheetShell('Your order', h('div', { class: 'empty', text: 'Your order is empty.' }), h('button', { class: 'btn', onclick: closeSheet, text: 'Browse menu' })); return; }
   if (!M.store.deliveryEnabled && cust.type === 'delivery') cust.type = 'pickup';
   if (!M.store.gcashEnabled && cust.method === 'gcash') cust.method = 'cash';
-  var keep = form || (form = { err: {}, busy: false, msg: '', cid: store('bt_cid') || ('c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)), ref: '', note: '' });
+  if (M.store.payFirst) cust.method = 'gcash';
+  var keep = form || (form = { err: {}, busy: false, msg: '', proof: '', cid: store('bt_cid') || ('c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 10)), ref: '', note: '' });
   store('bt_cid', keep.cid);
   var t = totals();
   var body = h('div', null,
@@ -162,13 +163,7 @@ function drawCart() {
     field('name', 'Your name', 'input', { value: cust.name, maxlength: 60, autocomplete: 'name', placeholder: 'e.g. Maria Cruz' }),
     field('phone', 'Mobile number', 'input', { value: cust.phone, maxlength: 20, inputmode: 'tel', autocomplete: 'tel', placeholder: '09XX XXX XXXX' }),
     cust.type === 'delivery' ? field('address', 'Delivery address', 'textarea', { value: cust.address, maxlength: 200, placeholder: 'House no., street, barangay, landmark' }) : null,
-    h('div', { class: 'sec', text: 'Payment' }),
-    h('div', { class: 'seg' },
-      h('button', { class: cust.method === 'cash' ? 'on' : '', onclick: function () { cust.method = 'cash'; keepForm(); drawCart(); }, text: cust.type === 'delivery' ? 'Cash on delivery' : 'Pay at the store' }),
-      M.store.gcashEnabled ? h('button', { class: cust.method === 'gcash' ? 'on' : '', onclick: function () { cust.method = 'gcash'; keepForm(); drawCart(); }, text: 'GCash' }) : null),
-    cust.method === 'gcash' ? h('div', null,
-      h('div', { class: 'gbox' }, 'Send ', h('b', { text: peso(t.total) }), ' to GCash ', h('b', { text: M.store.gcashNumber }), M.store.gcashName ? ' (' + M.store.gcashName + ')' : '', '. Then type the reference number below.'),
-      field('ref', 'GCash reference no. (optional)', 'input', { value: keep.ref, maxlength: 40, inputmode: 'numeric', placeholder: '13-digit reference' })) : null,
+    paySection(t, keep),
     field('note', 'Notes for the store (optional)', 'textarea', { value: keep.note, maxlength: 200, placeholder: 'e.g. no spring onions, extra spicy' }),
     h('div', { class: 'sum', style: 'margin-top:14px' },
       h('div', { class: 'row' }, h('span', { text: 'Subtotal' }), h('span', { text: peso(t.sub) })),
@@ -177,7 +172,7 @@ function drawCart() {
     M.store.minOrder > 0 ? h('div', { class: 'hint', text: 'Minimum order: ' + peso(M.store.minOrder) }) : null,
     keep.msg ? h('div', { class: 'formerr', text: keep.msg }) : null);
   var below = M.store.minOrder > 0 && t.sub < M.store.minOrder;
-  var btn = h('button', { class: 'btn', disabled: keep.busy || !canOrder() || below, onclick: placeOrder, text: keep.busy ? 'Placing order...' : !canOrder() ? 'Not accepting orders' : below ? 'Add ' + peso(M.store.minOrder - t.sub) + ' more' : 'Place order \u00B7 ' + peso(t.total) });
+  var btn = h('button', { class: 'btn', disabled: keep.busy || !canOrder() || below, onclick: placeOrder, text: keep.busy ? 'Placing order...' : !canOrder() ? 'Not accepting orders' : below ? 'Add ' + peso(M.store.minOrder - t.sub) + ' more' : (M.store.payFirst ? 'I have paid \u00B7 Place order' : 'Place order') + ' \u00B7 ' + peso(t.total) });
   var scroll = $('#shB') ? $('#shB').scrollTop : 0;
   sheetShell('Your order', body, btn);
   if ($('#shB')) $('#shB').scrollTop = scroll;
@@ -197,6 +192,7 @@ function validate() {
   var d = cust.phone.replace(/[^\d+]/g, '').replace(/^\+?63(?=\d{10}$)/, '0').replace(/^9(?=\d{9}$)/, '09').replace(/\D/g, '');
   if (d.length < 7 || d.length > 15) e.phone = 'Please enter a valid mobile number.';
   if (cust.type === 'delivery' && cust.address.trim().length < 6) e.address = 'Please enter your complete address.';
+  if (M.store.payFirst && cust.method === 'gcash' && String(form.ref || '').trim().length < 4) e.ref = 'Enter the GCash reference number from your payment.';
   return e;
 }
 function placeOrder() {
@@ -206,12 +202,12 @@ function placeOrder() {
   form.busy = true; drawCart();
   api('/api/orders', { method: 'POST', body: {
     clientId: form.cid, name: cust.name, phone: cust.phone, type: cust.type, address: cust.type === 'delivery' ? cust.address : '', note: form.note,
-    payment: { method: cust.method, ref: cust.method === 'gcash' ? form.ref : '' },
+    payment: { method: cust.method, ref: cust.method === 'gcash' ? form.ref : '' }, proof: cust.method === 'gcash' && form.proof ? form.proof : undefined,
     items: Object.keys(cart).map(function (k) { return { id: Number(k), qty: cart[k] }; })
   } }).then(function (r) {
     cart = {}; saveCart(); store('bt_cid', null); form = null;
-    track = { code: r.order.code }; store('bt_order', track); tOrder = r.order;
-    drawTrack(); startPoll(); loadMenu();
+    merge(r.order); saveMine(); viewCode = r.order.code;
+    drawTrack(); loadMenu();
   }, function (e) {
     form.busy = false; form.msg = e.message;
     if (e.data && e.data.field) form.err[e.data.field] = e.message;
@@ -220,57 +216,156 @@ function placeOrder() {
   });
 }
 
-/* ---------- tracking ---------- */
+/* ---------- payment section (GCash) ---------- */
+function copyText(t) {
+  var done = function () { toast('Copied'); };
+  try { if (navigator.clipboard && navigator.clipboard.writeText) { navigator.clipboard.writeText(t).then(done, fallback); return; } } catch (e) { /* fall through */ }
+  fallback();
+  function fallback() { try { var ta = h('textarea', { style: 'position:fixed;opacity:0' }); ta.value = t; document.body.appendChild(ta); ta.select(); document.execCommand('copy'); ta.remove(); done(); } catch (e) { toast('Could not copy - select the number instead'); } }
+}
+function shrink(file) {
+  return new Promise(function (res, rej) {
+    var fr = new FileReader(); fr.onerror = rej;
+    fr.onload = function () {
+      var img = new Image(); img.onerror = rej;
+      img.onload = function () {
+        var max = 1000, q = 0.72, out = '';
+        for (var i = 0; i < 6; i++) {
+          var sc = Math.min(1, max / Math.max(img.width, img.height)), c = document.createElement('canvas');
+          c.width = Math.max(1, Math.round(img.width * sc)); c.height = Math.max(1, Math.round(img.height * sc));
+          var x = c.getContext('2d'); x.fillStyle = '#fff'; x.fillRect(0, 0, c.width, c.height); x.drawImage(img, 0, 0, c.width, c.height);
+          out = c.toDataURL('image/jpeg', q); if (out.length < 520000) break;
+          max = Math.round(max * 0.8); q = Math.max(0.4, q - 0.08);
+        }
+        out.length < 600000 ? res(out) : rej(new Error('too big'));
+      };
+      img.src = fr.result;
+    };
+    fr.readAsDataURL(file);
+  });
+}
+function paySection(t, keep) {
+  var pf = M.store.payFirst, kids = [h('div', { class: 'sec', text: pf ? 'Pay first with GCash' : 'Payment' })];
+  if (!pf) kids.push(h('div', { class: 'seg' },
+    h('button', { class: cust.method === 'cash' ? 'on' : '', onclick: function () { cust.method = 'cash'; keepForm(); drawCart(); }, text: cust.type === 'delivery' ? 'Cash on delivery' : 'Pay at the store' }),
+    M.store.gcashEnabled ? h('button', { class: cust.method === 'gcash' ? 'on' : '', onclick: function () { cust.method = 'gcash'; keepForm(); drawCart(); }, text: 'GCash' }) : null));
+  if (cust.method !== 'gcash') return kids;
+  kids.push(h('div', { class: 'paybox' },
+    M.store.gcashQr ? h('div', { class: 'qrwrap' }, h('img', { class: 'qr', src: M.store.gcashQr, alt: 'GCash QR code' }), h('small', { text: 'Tip: press and hold the QR to save it, then upload it in GCash.' })) : null,
+    h('div', { class: 'payrow' }, h('span', { text: 'Send exactly' }), h('b', { class: 'amt', text: peso(t.total) })),
+    M.store.gcashName ? h('div', { class: 'payrow' }, h('span', { text: 'Account name' }), h('b', { text: M.store.gcashName })) : null,
+    h('div', { class: 'payrow' }, h('span', { text: 'GCash number' }), h('b', { text: M.store.gcashNumber }), h('button', { class: 'copy', onclick: function () { copyText(M.store.gcashNumber); }, text: 'Copy' }))));
+  kids.push(h('ol', { class: 'paysteps' }, h('li', { text: 'Pay the exact amount using the QR or number above.' }), h('li', { text: 'Type the reference number from your GCash receipt.' }), h('li', { text: 'Attach a screenshot of the receipt (optional but helps us confirm faster).' }), h('li', { text: 'Tap "I have paid" to send your order.' })));
+  kids.push(field('ref', pf ? 'GCash reference no. (required)' : 'GCash reference no. (optional)', 'input', { value: keep.ref, maxlength: 40, inputmode: 'numeric', placeholder: 'e.g. 1234 567 890123' }));
+  var inp = h('input', { type: 'file', accept: 'image/*', class: 'hidden', onchange: function (e) {
+    var f = e.target.files && e.target.files[0]; if (!f) return;
+    shrink(f).then(function (d) { keep.proof = d; drawCart(); }, function () { toast('Could not use that photo. Try another one.'); });
+  } });
+  kids.push(h('div', { class: 'fld' }, inp, keep.proof
+    ? h('div', { class: 'proof' }, h('img', { src: keep.proof, alt: 'Payment screenshot' }), h('button', { class: 'btn ghost sm', onclick: function () { keep.proof = ''; drawCart(); }, text: 'Remove screenshot' }))
+    : h('button', { class: 'btn ghost sm', style: 'margin-top:0', onclick: function () { inp.click(); }, text: 'Attach payment screenshot (optional)' })));
+  return kids;
+}
+
+/* ---------- my orders (dashboard) + tracking ---------- */
+var TERMINAL = ['completed', 'cancelled'];
+function isActive(o) { return !!o && TERMINAL.indexOf(o.status) < 0 && !o.lost; }
+function getMine(code) { return mine.find(function (x) { return x.code === code; }); }
+function merge(o) { var i = mine.findIndex(function (x) { return x.code === o.code; }); if (i < 0) mine.push(Object.assign({}, o)); else mine[i] = Object.assign({}, mine[i], o, { lost: false, miss: 0 }); }
+function saveMine() { mine.sort(function (a, b) { return b.createdAt - a.createdAt; }); if (mine.length > 30) mine.length = 30; store('bt_orders', mine); }
+function statusLabel(o) {
+  if (o.lost) return 'Not found - please call us';
+  return { new: 'Waiting for the store to confirm', preparing: 'Preparing your order', ready: o.type === 'delivery' ? 'Out for delivery' : 'Ready for pick-up', completed: o.type === 'delivery' ? 'Delivered' : 'Picked up', cancelled: 'Cancelled' }[o.status] || o.status;
+}
+function when(t) { return new Date(t).toLocaleString('en-PH', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' }); }
+function tm(t) { return t ? new Date(t).toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' }) : ''; }
 var STEPS = { pickup: ['Order received', 'Preparing your order', 'Ready for pick-up', 'Picked up - enjoy!'], delivery: ['Order received', 'Preparing your order', 'Out for delivery', 'Delivered - enjoy!'] };
 var IDX = { new: 0, preparing: 1, ready: 2, completed: 3 };
-var HEAD = { new: 'Waiting for the store to confirm...', preparing: 'We are preparing your order', ready: null, completed: 'All done - salamat!', cancelled: 'Order cancelled' };
-function tm(t) { return t ? new Date(t).toLocaleTimeString('en-PH', { hour: 'numeric', minute: '2-digit' }) : ''; }
-function isDone(o) { return !o || o.status === 'completed' || o.status === 'cancelled'; }
+var KEYS = ['new', 'preparing', 'ready', 'completed'];
+
+function orderCard(o) {
+  var names = o.items.slice(0, 2).map(function (i) { return i.qty + ' x ' + i.name; }).join(', ') + (o.items.length > 2 ? ' +' + (o.items.length - 2) + ' more' : '');
+  return h('button', { class: 'ocard', onclick: function () { viewCode = o.code; drawTrack(); } },
+    h('div', { class: 'oc-h' }, h('b', { text: o.code }), h('span', { class: 'oc-st ' + (o.lost ? 'cancelled' : o.status), text: o.lost ? 'Not found' : { new: 'Waiting', preparing: 'Preparing', ready: o.type === 'delivery' ? 'On the way' : 'Ready', completed: 'Done', cancelled: 'Cancelled' }[o.status] }), h('small', { text: when(o.createdAt) })),
+    h('div', { class: 'oc-i', text: names }),
+    h('div', { class: 'oc-f' }, h('span', { text: (o.type === 'delivery' ? 'Delivery' : 'Pick-up') + ' \u00B7 ' + (o.payment.method === 'gcash' ? 'GCash' : 'Cash') }), h('b', { text: peso(o.total) })));
+}
+function drawOrders() {
+  openSheet('orders');
+  var kids = [];
+  if (!mine.length) kids.push(h('div', { class: 'empty', text: 'No orders yet on this phone. Orders you place will appear here.' }));
+  mine.forEach(function (o) { kids.push(orderCard(o)); });
+  kids.push(h('div', { class: 'sec', text: 'Ordered from another phone?' }), findForm());
+  sheetShell('My orders', h('div', null, kids), h('button', { class: 'btn ghost sm', style: 'margin-top:0', onclick: closeSheet, text: 'Back to menu' }));
+}
+function findForm() {
+  var code = h('input', { class: 'in', placeholder: 'Order number e.g. BT-7K2QF9', maxlength: 12, autocapitalize: 'characters' }),
+    p4 = h('input', { class: 'in', placeholder: 'Last 4 digits of your mobile number', maxlength: 4, inputmode: 'numeric' }),
+    err = h('div', { class: 'ferr' }), btn = h('button', { class: 'btn sm', text: 'Find my order' });
+  btn.addEventListener('click', function () {
+    err.textContent = ''; btn.disabled = true;
+    api('/api/orders/find', { method: 'POST', body: { code: code.value, phone4: p4.value } }).then(function (r) { merge(r.order); saveMine(); viewCode = r.order.code; drawTrack(); }, function (e) { btn.disabled = false; err.textContent = e.message; });
+  });
+  return h('div', { class: 'find' }, h('label', { class: 'fld' }, code), h('label', { class: 'fld' }, p4), err, h('div', { style: 'margin-top:10px' }, btn));
+}
+function row(k, v) { return v ? h('div', { class: 'drow' }, h('span', { text: k }), h('b', { text: v })) : null; }
 function drawTrack() {
+  var o = getMine(viewCode);
+  if (!o) { drawOrders(); return; }
   openSheet('track');
-  var o = tOrder;
-  if (!o) { sheetShell('Your order', h('div', { class: 'loading', text: 'Loading...' })); return; }
-  var steps = STEPS[o.type] || STEPS.pickup, cur = IDX[o.status], head = HEAD[o.status] || (o.type === 'delivery' ? 'Your order is on the way!' : 'Your order is ready for pick-up!');
-  var kids = [h('div', { class: 'done' }, h('div', { class: 'hint', text: 'Order number' }), h('div', { class: 'code', text: o.code }), h('div', { class: 'stat', text: head }))];
-  if (o.status === 'cancelled') kids.push(h('div', { class: 'cancelled-box', text: o.cancelReason ? 'Reason: ' + o.cancelReason : 'This order was cancelled.' }));
-  else kids.push(h('ol', { class: 'steps' }, steps.map(function (s, i) { return h('li', { class: i < cur || o.status === 'completed' ? 'on' : (i === cur ? 'cur' : '') }, s, i <= cur && o.times && o.times[['new', 'preparing', 'ready', 'completed'][i]] ? h('small', { text: tm(o.times[['new', 'preparing', 'ready', 'completed'][i]]) }) : null); })));
-  kids.push(h('div', { class: 'sec', text: 'Your order' }));
+  var steps = STEPS[o.type] || STEPS.pickup, cur = IDX[o.status];
+  var kids = [h('div', { class: 'done' }, h('div', { class: 'hint', text: 'Order number' }), h('div', { class: 'code', text: o.code }), h('div', { class: 'stat', text: statusLabel(o) }))];
+  if (o.lost) kids.push(h('div', { class: 'cancelled-box', text: 'The store no longer has this order on record. If you already paid, please call the store' + (M && M.store.phone ? ' at ' + M.store.phone : '') + '.' }));
+  else if (o.status === 'cancelled') kids.push(h('div', { class: 'cancelled-box', text: o.cancelReason ? 'Reason: ' + o.cancelReason : 'This order was cancelled.' }));
+  else kids.push(h('ol', { class: 'steps' }, steps.map(function (s, i) { var tt = o.times && o.times[KEYS[i]]; return h('li', { class: i < cur || o.status === 'completed' ? 'on' : (i === cur ? 'cur' : '') }, s, i <= cur && tt ? h('small', { text: tm(tt) }) : null); })));
+  kids.push(h('div', { class: 'sec', text: 'Order information' }));
+  kids.push(h('div', { class: 'dbox' },
+    row('Placed', when(o.createdAt)), row('Name', o.fullName || o.name), row('Mobile', o.phone), row('Type', o.type === 'delivery' ? 'Delivery' : 'Pick-up'), row('Address', o.type === 'delivery' ? o.address : ''),
+    row('Payment', o.payment.method === 'gcash' ? 'GCash' + (o.payment.ref ? ' \u00B7 ref ' + o.payment.ref : '') + (o.payment.hasProof ? ' \u00B7 screenshot sent' : '') : (o.type === 'delivery' ? 'Cash on delivery' : 'Pay at the store')), row('Notes', o.note)));
+  kids.push(h('div', { class: 'sec', text: 'Items' }));
   o.items.forEach(function (i) { kids.push(h('div', { class: 'ci' }, h('div', { class: 'm' }, h('b', { text: i.qty + ' x ' + i.name })), h('div', { class: 'p', text: peso(i.price * i.qty) }))); });
   if (o.fee) kids.push(h('div', { class: 'ci' }, h('div', { class: 'm' }, h('b', { text: 'Delivery fee' })), h('div', { class: 'p', text: peso(o.fee) })));
-  kids.push(h('div', { class: 'ci' }, h('div', { class: 'm' }, h('b', { text: 'Total \u00B7 ' + (o.payment.method === 'gcash' ? 'GCash' : o.type === 'delivery' ? 'Cash on delivery' : 'Pay at the store') })), h('div', { class: 'p', text: peso(o.total) })));
+  kids.push(h('div', { class: 'ci' }, h('div', { class: 'm' }, h('b', { text: 'Total' })), h('div', { class: 'p', text: peso(o.total) })));
   var foot = [];
-  if (o.status === 'new') foot.push(h('button', { class: 'btn ghost sm', onclick: cancelOrder, text: 'Cancel order' }));
-  foot.push(h('button', { class: 'btn' + (isDone(o) ? '' : ' ghost sm'), onclick: function () { if (isDone(o)) { track = null; store('bt_order', null); tOrder = null; } closeSheet(); }, text: isDone(o) ? 'Order again' : 'Back to menu' }));
-  var s = $('#sheet'); var sc = $('#shB') ? $('#shB').scrollTop : 0;
+  if (o.status === 'new' && !o.lost) foot.push(h('button', { class: 'btn ghost sm', style: 'margin-top:0;margin-bottom:10px', onclick: cancelOrder, text: 'Cancel order' }));
+  foot.push(h('button', { class: 'btn ghost sm', style: 'margin-top:0;margin-bottom:10px', onclick: drawOrders, text: 'All my orders' }));
+  foot.push(h('button', { class: 'btn', onclick: closeSheet, text: isActive(o) ? 'Back to menu' : 'Order again' }));
+  var sc = $('#shB') ? $('#shB').scrollTop : 0;
   sheetShell('Track your order', h('div', null, kids), h('div', null, foot));
   if ($('#shB')) $('#shB').scrollTop = sc;
 }
 function cancelOrder() {
-  if (!track || !confirm('Cancel this order?')) return;
-  api('/api/orders/' + encodeURIComponent(track.code) + '/cancel', { method: 'POST' }).then(function (r) { tOrder = r.order; drawTrack(); }, function (e) { toast(e.message); pollOnce(); });
+  var o = getMine(viewCode); if (!o || !confirm('Cancel this order?')) return;
+  api('/api/orders/' + encodeURIComponent(o.code) + '/cancel', { method: 'POST' }).then(function (r) { merge(r.order); saveMine(); drawTrack(); }, function (e) { toast(e.message); pollMine(); });
 }
 function renderTrackBar() {
-  var b = $('#trackBar');
-  if (!track || !tOrder || sheetKind) { b.classList.add('hidden'); return; }
+  var b = $('#trackBar'), o = mine.filter(isActive)[0];
+  var n = mine.filter(isActive).length, ob = $('#ordersN');
+  ob.textContent = n; ob.classList.toggle('hidden', !n);
+  if (!o || sheetKind) { b.classList.add('hidden'); return; }
   b.classList.remove('hidden');
-  b.replaceChildren(h('small', { text: 'Your order ' + tOrder.code }), document.createTextNode(HEAD[tOrder.status] || (tOrder.type === 'delivery' ? 'Out for delivery' : 'Ready for pick-up') ), document.createTextNode(' \u203A'));
+  b.replaceChildren(h('small', { text: 'Your order ' + o.code + (n > 1 ? ' (+' + (n - 1) + ' more)' : '') }), document.createTextNode(statusLabel(o) + ' \u203A'));
 }
-$('#trackBar').addEventListener('click', function () { drawTrack(); });
-var pollT = null;
-function pollOnce() {
-  if (!track) return Promise.resolve();
-  return api('/api/orders/' + encodeURIComponent(track.code)).then(function (r) {
-    var changed = !tOrder || tOrder.status !== r.order.status || tOrder.updatedAt !== r.order.updatedAt;
-    tOrder = r.order;
-    if (changed) { if (sheetKind === 'track') drawTrack(); else renderTrackBar(); }
-  }, function (e) { if (e.status === 404) { track = null; tOrder = null; store('bt_order', null); stopPoll(); if (sheetKind === 'track') closeSheet(); else render(); } });
+$('#trackBar').addEventListener('click', function () { var o = mine.filter(isActive)[0]; if (o) { viewCode = o.code; drawTrack(); } });
+$('#ordersBtn').addEventListener('click', function () { drawOrders(); });
+
+var polling = false;
+function refreshViews() { if (sheetKind === 'track') drawTrack(); else if (sheetKind === 'orders') drawOrders(); else render(); }
+function pollMine() {
+  var act = mine.filter(isActive); if (!act.length || polling) return Promise.resolve();
+  polling = true;
+  return api('/api/orders/lookup', { method: 'POST', body: { codes: act.map(function (o) { return o.code; }) } }).then(function (r) {
+    var changed = false, seen = {};
+    r.orders.forEach(function (o) { seen[o.code] = 1; var old = getMine(o.code); if (!old || old.status !== o.status || old.updatedAt !== o.updatedAt || old.lost) changed = true; merge(o); });
+    act.forEach(function (o) { if (!seen[o.code]) { var m = getMine(o.code); m.miss = (m.miss || 0) + 1; if (m.miss >= 3 && !m.lost) { m.lost = true; changed = true; } } });
+    saveMine(); if (changed) refreshViews();
+  }, function () { /* offline - try again on the next tick */ }).then(function () { polling = false; });
 }
-function startPoll() { stopPoll(); pollT = setInterval(function () { if (document.hidden) return; if (isDone(tOrder) && tOrder) { stopPoll(); return; } pollOnce(); }, 5000); }
-function stopPoll() { if (pollT) clearInterval(pollT); pollT = null; }
-document.addEventListener('visibilitychange', function () { if (!document.hidden) { loadMenu(); if (track && !isDone(tOrder)) { pollOnce(); startPoll(); } } });
+setInterval(function () { if (!document.hidden) pollMine(); }, 5000);
+document.addEventListener('visibilitychange', function () { if (!document.hidden) { loadMenu(); pollMine(); } });
 setInterval(function () { if (!document.hidden && !sheetKind) loadMenu(); }, 60000);
 
 /* ---------- boot ---------- */
 loadMenu();
-if (track) { pollOnce().then(function () { renderTrackBar(); if (tOrder && !isDone(tOrder)) startPoll(); else if (tOrder && Date.now() - tOrder.updatedAt > 2 * 3600000) { track = null; tOrder = null; store('bt_order', null); render(); } }); }
+pollMine().then(renderTrackBar);
 })();
